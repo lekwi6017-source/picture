@@ -765,4 +765,430 @@ function renderGallery() {
     const list = getFiltered();
     if (list.length === 0) {
       el.gallery.innerHTML = '<div class="state-box"><div class="state-icon">🔍</div><p>没有匹配的资源</p></div>';
-    } else
+    } else {
+      const html = list.map(function (a) {
+        return state.view === 'grid' ? cardHTML(a) : rowHTML(a);
+      }).join('');
+      el.gallery.innerHTML = html;
+    }
+  }
+
+  el.gallery.scrollTop = scrollTop;
+  renderBatchBar();
+}
+
+function renderBatchBar() {
+  const n = state.selected.size;
+  el.batchBar.classList.toggle('hidden', n === 0);
+  el.batchCount.textContent = '已选 ' + n + ' 项';
+}
+
+/* ---------------------------- 详情面板 ---------------------------- */
+function openDetail(path) {
+  const a = state.assets.filter(function (x) { return x.path === path; })[0] || null;
+  state.current = a;
+  renderDetail();
+  if (window.innerWidth <= 1024) switchTab('right');
+}
+
+function renderDetail() {
+  const a = state.current;
+  if (!a) {
+    el.detailBox.className = 'detail-empty';
+    el.detailBox.innerHTML = '<div class="state-icon">🖼️</div><p>在中间画廊选择一项查看详情</p>';
+    return;
+  }
+  el.detailBox.className = '';
+  const link = extLink(a.path);
+  const raw = rawUrl(a.path);
+
+  let preview = '';
+  if (a.type === 'image') {
+    preview = '<div class="detail-preview"><img src="' + esc(raw) + '" alt="' + esc(a.name) + '" /></div>';
+  } else if (a.type === 'audio') {
+    preview = '<div class="detail-preview audio"><audio controls preload="none" src="' + esc(raw) + '"></audio></div>';
+  } else {
+    preview = '<div class="detail-preview font"><span class="ph-glyph">Aa</span><span>' +
+      esc((a.ext || '').toUpperCase()) + ' 字体文件</span></div>';
+  }
+
+  el.detailBox.innerHTML = '' +
+    preview +
+    '<div class="detail-row"><span class="k">文件名</span><span class="v">' + esc(a.name) + '</span></div>' +
+    '<div class="detail-row"><span class="k">路径</span><span class="v mono">' + esc(a.path) + '</span></div>' +
+    '<div class="detail-row"><span class="k">类型</span><span class="v">' + (TYPE_LABEL[a.type] || '') + ' · ' + esc(a.ext) + '</span></div>' +
+    '<div class="detail-row"><span class="k">大小</span><span class="v">' + fmtSize(a.size) + '</span></div>' +
+    '<div class="detail-row"><span class="k">SHA</span><span class="v mono">' + esc(String(a.sha || '').slice(0, 10)) + '</span></div>' +
+    '<label class="field-label">对外链接</label>' +
+    '<div class="link-box">' +
+      '<input class="input mono" readonly id="detailLink" value="' + esc(link) + '" />' +
+      '<button class="btn btn-primary btn-sm" id="detailCopy">复制</button>' +
+    '</div>' +
+    '<div class="detail-actions">' +
+      '<a class="btn btn-ghost btn-sm" href="' + esc(raw) + '" target="_blank" rel="noopener">查看原文件</a>' +
+      '<button class="btn btn-danger btn-sm" id="detailDelete">删除此文件</button>' +
+    '</div>';
+
+  const copyBtn = $('#detailCopy');
+  const delBtn = $('#detailDelete');
+  if (copyBtn) copyBtn.addEventListener('click', function () { handleCopy(a.path); });
+  if (delBtn) delBtn.addEventListener('click', function () { handleDelete(a.path); });
+}
+
+/* ---------------------------- 复制 ---------------------------- */
+async function handleCopy(path) {
+  const link = extLink(path);
+  const ok = await copyText(link);
+  if (ok) toast('外链已复制：' + link, 'success', 2400);
+  else toast('复制失败，请手动选中链接复制', 'error', 3200);
+}
+
+/* ---------------------------- 删除 ---------------------------- */
+async function deleteOne(path) {
+  const g = await gh('/contents/' + encodePath(path) + '?ref=' + encodeURIComponent(CONFIG.GITHUB_BRANCH));
+  if (!g.ok) return g;
+  const sha = g.data && g.data.sha;
+  if (!sha) return { ok: false, message: '无法获取文件 SHA，删除已中止' };
+  return gh('/contents/' + encodePath(path), {
+    method: 'DELETE',
+    body: JSON.stringify({
+      message: 'delete: ' + path,
+      branch: CONFIG.GITHUB_BRANCH,
+      sha: sha
+    })
+  });
+}
+
+async function handleDelete(path) {
+  if (!state.token) { toast('请先验证并保存 Token', 'error'); return; }
+  const sure = window.confirm('确定要删除吗？\n\n' + path + '\n\n该操作会直接提交到 GitHub，不可撤销。');
+  if (!sure) return;
+
+  toast('正在删除…', 'info', 1200);
+  const r = await deleteOne(path);
+  if (r.ok) {
+    toast('已删除：' + path, 'success');
+    state.selected.delete(path);
+    if (state.current && state.current.path === path) state.current = null;
+    renderDetail();
+    await loadAssets();
+  } else {
+    toast(r.message || '删除失败', 'error', 4200);
+  }
+}
+
+/* ---------------------------- 批量操作 ---------------------------- */
+async function batchCopy() {
+  const paths = Array.from(state.selected);
+  if (!paths.length) return;
+  const text = paths.map(function (p) { return extLink(p); }).join('\n');
+  const ok = await copyText(text);
+  if (ok) toast('已复制 ' + paths.length + ' 条外链', 'success');
+  else toast('复制失败，请手动复制', 'error');
+}
+
+async function batchDelete() {
+  const paths = Array.from(state.selected);
+  if (!paths.length) return;
+  const sure = window.confirm('确定删除选中的 ' + paths.length + ' 个文件吗？\n\n该操作不可撤销。');
+  if (!sure) return;
+
+  let ok = 0, fail = 0;
+  for (let i = 0; i < paths.length; i++) {
+    const r = await deleteOne(paths[i]);
+    if (r.ok) ok++; else fail++;
+  }
+  toast('批量删除完成：成功 ' + ok + ' 个' + (fail ? '，失败 ' + fail + ' 个' : ''),
+        fail ? 'error' : 'success', 3600);
+  state.selected.clear();
+  state.current = null;
+  renderDetail();
+  await loadAssets();
+}
+
+/* ---------------------------- 上传 ---------------------------- */
+async function uploadOne(file, dir) {
+  const path = (dir ? dir + '/' : '') + file.name;
+
+  // 1) 检查是否已存在（存在则覆盖）
+  let sha = null;
+  const chk = await gh('/contents/' + encodePath(path) + '?ref=' + encodeURIComponent(CONFIG.GITHUB_BRANCH));
+  if (chk.ok) {
+    sha = chk.data && chk.data.sha;
+    if (!sha) throw new Error('目标路径已存在但无法读取 SHA');
+  } else if (chk.status !== 404) {
+    throw new Error(chk.message || '检查文件是否存在失败');
+  }
+
+  // 2) 读取为 base64
+  const content = await fileToBase64(file);
+
+  // 3) 提交
+  const body = {
+    message: (sha ? 'update: ' : 'upload: ') + path,
+    content: content,
+    branch: CONFIG.GITHUB_BRANCH
+  };
+  if (sha) body.sha = sha;
+
+  const r = await gh('/contents/' + encodePath(path), {
+    method: 'PUT',
+    body: JSON.stringify(body)
+  });
+  if (!r.ok) throw new Error(r.message || '上传失败');
+  return r.data;
+}
+
+function renderQueue() {
+  if (!state.uploads.length) { el.uploadQueue.innerHTML = ''; return; }
+  el.uploadQueue.innerHTML = state.uploads.map(function (it) {
+    return '<div class="q-item ' + it.status + '">' +
+      '<span class="q-name" title="' + esc(it.name) + '">' + esc(it.name) + '</span>' +
+      '<span class="q-msg">' + esc(it.msg) + '</span>' +
+    '</div>';
+  }).join('');
+}
+
+async function handleFiles(fileList) {
+  if (!state.token) { toast('请先验证并保存 Token', 'error'); return; }
+  const files = Array.prototype.slice.call(fileList || []);
+  if (!files.length) return;
+
+  const accepted = [];
+  const skipped = [];
+  files.forEach(function (f) {
+    const ext = extOf(f.name);
+    if (EXT_TYPE[ext] && f.size <= MAX_FILE_SIZE) accepted.push(f);
+    else skipped.push(f.name);
+  });
+
+  if (skipped.length) {
+    toast('已跳过 ' + skipped.length + ' 个文件（类型不支持或超过 25MB）：' +
+          skipped.slice(0, 3).join('、') + (skipped.length > 3 ? ' 等' : ''), 'error', 4200);
+  }
+  if (!accepted.length) return;
+
+  const dir = el.uploadDir.value.trim().replace(/^\/+|\/+$/g, '');
+  const items = accepted.map(function (f) {
+    return { name: f.name, status: 'pending', msg: '排队中' };
+  });
+  state.uploads = items;
+  renderQueue();
+
+  let okCount = 0, failCount = 0;
+
+  for (let i = 0; i < accepted.length; i++) {
+    const item = items[i];
+    item.status = 'doing';
+    item.msg = '上传中…';
+    renderQueue();
+    try {
+      await uploadOne(accepted[i], dir);
+      item.status = 'done';
+      item.msg = '上传成功';
+      okCount++;
+    } catch (err) {
+      item.status = 'fail';
+      item.msg = (err && err.message) ? err.message : '上传失败';
+      failCount++;
+    }
+    renderQueue();
+  }
+
+  toast('上传完成：成功 ' + okCount + ' 个' + (failCount ? '，失败 ' + failCount + ' 个' : ''),
+        failCount ? 'error' : 'success', 3600);
+
+  await loadAssets();
+}
+
+/* ---------------------------- 新建目录 ---------------------------- */
+async function createDir() {
+  if (!state.token) { toast('请先验证并保存 Token', 'error'); return; }
+  const raw = el.dirInput.value.trim().replace(/^\/+|\/+$/g, '');
+  if (!raw) { toast('请输入目录名', 'error'); return; }
+  if (/[\\:*?"<>|]/.test(raw)) { toast('目录名包含非法字符', 'error'); return; }
+
+  const keepPath = raw + '/.gitkeep';
+
+  const chk = await gh('/contents/' + encodePath(keepPath) + '?ref=' + encodeURIComponent(CONFIG.GITHUB_BRANCH));
+  if (chk.ok) { toast('该目录已存在：' + raw, 'error'); return; }
+
+  const r = await gh('/contents/' + encodePath(keepPath), {
+    method: 'PUT',
+    body: JSON.stringify({
+      message: 'chore: create directory ' + raw,
+      content: btoa('\n'),
+      branch: CONFIG.GITHUB_BRANCH
+    })
+  });
+
+  if (r.ok) {
+    toast('目录已创建：' + raw, 'success');
+    el.dirInput.value = '';
+    await loadAssets();
+  } else {
+    toast(r.message || '创建目录失败', 'error', 4200);
+  }
+}
+
+/* ---------------------------- 标签页 ---------------------------- */
+function switchTab(name) {
+  el.tabs.forEach(function (t) { t.classList.toggle('active', t.dataset.tab === name); });
+  Object.keys(el.panels).forEach(function (k) {
+    if (el.panels[k]) el.panels[k].classList.toggle('active', k === name);
+  });
+}
+
+/* ---------------------------- 事件绑定 ---------------------------- */
+function bindEvents() {
+  // Token
+  el.verifyBtn.addEventListener('click', function () { doVerify(el.tokenInput.value, false); });
+  el.tokenInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') doVerify(el.tokenInput.value, false);
+  });
+  el.clearTokenBtn.addEventListener('click', clearToken);
+
+  // 刷新
+  el.refreshBtn.addEventListener('click', function () {
+    if (!state.token) { toast('请先验证并保存 Token', 'error'); return; }
+    loadAssets();
+  });
+
+  // 上传
+  el.dropZone.addEventListener('click', function () { el.fileInput.click(); });
+  el.fileInput.addEventListener('change', function () {
+    handleFiles(el.fileInput.files);
+    el.fileInput.value = '';
+  });
+  ['dragenter', 'dragover'].forEach(function (ev) {
+    el.dropZone.addEventListener(ev, function (e) {
+      e.preventDefault(); e.stopPropagation();
+      el.dropZone.classList.add('drag');
+    });
+  });
+  ['dragleave', 'dragend'].forEach(function (ev) {
+    el.dropZone.addEventListener(ev, function (e) {
+      e.preventDefault();
+      el.dropZone.classList.remove('drag');
+    });
+  });
+  el.dropZone.addEventListener('drop', function (e) {
+    e.preventDefault(); e.stopPropagation();
+    el.dropZone.classList.remove('drag');
+    if (e.dataTransfer && e.dataTransfer.files) handleFiles(e.dataTransfer.files);
+  });
+  // 防止整页被拖入
+  window.addEventListener('dragover', function (e) { e.preventDefault(); });
+  window.addEventListener('drop', function (e) { e.preventDefault(); });
+
+  // 新建目录
+  el.createDirBtn.addEventListener('click', createDir);
+  el.dirInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') createDir();
+  });
+
+  // 搜索
+  el.searchInput.addEventListener('input', function () {
+    state.search = el.searchInput.value;
+    renderGallery();
+  });
+
+  // 类型筛选
+  el.typeFilter.addEventListener('click', function (e) {
+    const btn = e.target.closest('[data-type]');
+    if (!btn) return;
+    state.filterType = btn.dataset.type;
+    $$('[data-type]', el.typeFilter).forEach(function (x) {
+      x.classList.toggle('active', x === btn);
+    });
+    renderGallery();
+  });
+
+  // 视图切换
+  el.viewGrid.addEventListener('click', function () {
+    state.view = 'grid';
+    el.viewGrid.classList.add('active');
+    el.viewList.classList.remove('active');
+    renderGallery();
+  });
+  el.viewList.addEventListener('click', function () {
+    state.view = 'list';
+    el.viewList.classList.add('active');
+    el.viewGrid.classList.remove('active');
+    renderGallery();
+  });
+
+  // 批量
+  el.batchCopy.addEventListener('click', batchCopy);
+  el.batchDelete.addEventListener('click', batchDelete);
+  el.batchClear.addEventListener('click', function () {
+    state.selected.clear();
+    renderGallery();
+  });
+
+  // 标签页
+  el.tabs.forEach(function (t) {
+    t.addEventListener('click', function () { switchTab(t.dataset.tab); });
+  });
+
+  // 画廊：勾选
+  el.gallery.addEventListener('change', function (e) {
+    const cb = e.target.closest('[data-check]');
+    if (!cb) return;
+    const path = cb.dataset.check;
+    if (cb.checked) state.selected.add(path);
+    else state.selected.delete(path);
+    renderGallery();
+  });
+
+  // 画廊：点击
+  el.gallery.addEventListener('click', function (e) {
+    const actBtn = e.target.closest('[data-act]');
+    if (actBtn) {
+      e.preventDefault();
+      e.stopPropagation();
+      const p = actBtn.dataset.path;
+      if (actBtn.dataset.act === 'copy') handleCopy(p);
+      else if (actBtn.dataset.act === 'del') handleDelete(p);
+      return;
+    }
+    if (e.target.closest('.card-check') || e.target.tagName === 'INPUT') return;
+
+    const opener = e.target.closest('[data-open]');
+    if (opener) { openDetail(opener.dataset.open); return; }
+
+    const wrap = e.target.closest('[data-path]');
+    if (wrap && (wrap.classList.contains('card') || wrap.classList.contains('row-item'))) {
+      openDetail(wrap.dataset.path);
+    }
+  });
+}
+
+/* ---------------------------- 初始化 ---------------------------- */
+function init() {
+  el.repoInfo.textContent = CONFIG.GITHUB_OWNER + '/' + CONFIG.GITHUB_REPO + ' · ' + CONFIG.GITHUB_BRANCH;
+
+  if (!Store.available) {
+    el.tokenHint.textContent = '当前环境无法使用 localStorage（无痕模式 / 沙箱），Token 仅保存在内存中，刷新页面后需重新输入。';
+  }
+
+  bindEvents();
+  renderGallery();
+  renderDetail();
+
+  const saved = Store.get(STORAGE_KEY);
+  if (saved) {
+    el.tokenInput.value = saved;
+    doVerify(saved, true);
+  } else {
+    setAuthBadge('idle', '未授权');
+  }
+
+  // 窄屏默认展示左栏
+  if (window.innerWidth <= 1024) switchTab('left');
+}
+
+init();
+</script>
+</body>
+</html>
